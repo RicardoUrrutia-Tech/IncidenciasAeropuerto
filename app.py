@@ -1,151 +1,248 @@
 import streamlit as st
 import pandas as pd
+from io import BytesIO
 
-from utils import (
-    read_excel,
-    build_shift_catalog,
-    prepare_activos_turnos,
-    prepare_asistencias,
-    detect_incidencias,
-    build_outputs,
-    to_excel_bytes,
-)
+st.set_page_config(page_title="Incidencias / Ausentismo / Asistencia", layout="wide")
 
-st.set_page_config(page_title="Incidencias / Ausentismo / Cumplimiento", layout="wide")
+# ------------------------
+# Helpers
+# ------------------------
+def normalize_rut(x: str) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().upper()
+    s = s.replace(".", "").replace(" ", "")
+    # mantener guión si existe
+    # si viene sin guión y termina en K o dígito, podríamos inferir, pero no lo haré por seguridad
+    return s
 
-st.title("APP Reportes Incidencias / Ausentismo / Cumplimiento")
+def try_parse_date_any(x):
+    # soporta "29-nov-25", "2025-11-29", datetime, etc.
+    if pd.isna(x):
+        return pd.NaT
+    return pd.to_datetime(x, errors="coerce", dayfirst=True)
+
+def excel_to_df(file, sheet_index=0):
+    # Lee por índice de hoja, no por nombre (Hoja 1 / Hoja 2 da igual)
+    return pd.read_excel(file, sheet_name=sheet_index, engine="openpyxl")
+
+def to_excel_bytes(df_dict):
+    # df_dict: {"NombreHoja": df, ...}
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        for name, df in df_dict.items():
+            df.to_excel(writer, index=False, sheet_name=name[:31])
+    output.seek(0)
+    return output
+
+# ------------------------
+# UI
+# ------------------------
+st.title("App Incidencias / Ausentismo / Asistencia")
 
 with st.sidebar:
-    st.header("📥 Carga de archivos (Excel)")
-    f_cod = st.file_uploader("1) Base Codificación Turnos (BUK)", type=["xlsx"])
-    f_act = st.file_uploader("2) Trabajadores Activos + Turnos", type=["xlsx"])
-    f_det = st.file_uploader("3) Detalle Turnos Colaboradores (BUK)", type=["xlsx"])
-    f_asi = st.file_uploader("4) Base Asistencias PBI (marcajes)", type=["xlsx"])
+    st.header("Cargar archivos (Excel)")
+    f_turnos = st.file_uploader("1) Codificación Turnos BUK", type=["xlsx"])
+    f_activos = st.file_uploader("2) Trabajadores Activos + Turnos", type=["xlsx"])
+    f_inasist = st.file_uploader("3) Inasistencias PBI", type=["xlsx"])
+    f_asist = st.file_uploader("4) Asistencias PBI", type=["xlsx"])
 
     st.divider()
-    st.caption("Opcional")
-    f_manual = st.file_uploader("Ingreso manual incidencias (opcional)", type=["xlsx"])
+    st.subheader("Reglas (MVP)")
+    umbral_diff_turno = st.number_input("Umbral Diferencia Turno Real (horas)", value=0.5, step=0.5)
+    only_area = st.text_input("Filtrar Área (opcional)", value="AEROPUERTO")
+    st.caption("El filtro de Área es opcional. Déjalo vacío para no filtrar.")
 
-    st.divider()
-    tolerance_min = st.number_input("Tolerancia (min) para atrasos/anticipos", min_value=0, max_value=120, value=5, step=1)
-
-if not (f_cod and f_act and f_det and f_asi):
-    st.info("Carga los 4 archivos obligatorios para comenzar.")
+if not all([f_turnos, f_activos, f_inasist, f_asist]):
+    st.info("Sube los 4 archivos para comenzar.")
     st.stop()
 
-# ---- Load
-df_cod = read_excel(f_cod)
-df_act = read_excel(f_act)
-df_det = read_excel(f_det)
-df_asi = read_excel(f_asi)
+# ------------------------
+# Load
+# ------------------------
+df_turnos = excel_to_df(f_turnos, 0)
+df_activos = excel_to_df(f_activos, 0)
+df_inasist = excel_to_df(f_inasist, 0)
+df_asist = excel_to_df(f_asist, 0)
 
-shift_catalog = build_shift_catalog(df_cod)
+# Normalize basic fields
+for df in [df_activos, df_inasist, df_asist]:
+    if "RUT" in df.columns:
+        df["RUT_norm"] = df["RUT"].apply(normalize_rut)
 
-# ---- Prepare
-act_long = prepare_activos_turnos(df_act, shift_catalog)
-asist = prepare_asistencias(df_asi, shift_catalog)
+# ------------------------
+# Turnos activos (formato ancho -> largo)
+# ------------------------
+fixed_cols = [c for c in ["Nombre del Colaborador", "RUT", "Área", "Supervisor"] if c in df_activos.columns]
+date_cols = [c for c in df_activos.columns if c not in fixed_cols]
 
-# (Opcional) manual
-manual_df = None
-if f_manual is not None:
-    manual_df = read_excel(f_manual)
+df_act_long = df_activos.melt(
+    id_vars=fixed_cols,
+    value_vars=date_cols,
+    var_name="Fecha",
+    value_name="Turno_Activo"
+)
+df_act_long["Fecha_dt"] = df_act_long["Fecha"].apply(try_parse_date_any)
+df_act_long["RUT_norm"] = df_act_long["RUT"].apply(normalize_rut) if "RUT" in df_act_long.columns else ""
 
-# ---- Incidencias
-incidencias = detect_incidencias(
-    act_long=act_long,
-    asist=asist,
-    df_det=df_det,
-    tolerance_min=int(tolerance_min),
-    manual_df=manual_df,
+# Limpiar blancos
+df_act_long["Turno_Activo"] = df_act_long["Turno_Activo"].astype(str).str.strip()
+df_act_long.loc[df_act_long["Turno_Activo"].isin(["", "nan", "NaT", "None"]), "Turno_Activo"] = ""
+
+# ------------------------
+# Asistencias / Inasistencias: clave rut-fecha
+# ------------------------
+# Asistencias: usar Fecha Entrada como fecha base
+if "Fecha Entrada" in df_asist.columns:
+    df_asist["Fecha_base"] = df_asist["Fecha Entrada"].apply(try_parse_date_any)
+elif "Día" in df_asist.columns:
+    df_asist["Fecha_base"] = df_asist["Día"].apply(try_parse_date_any)
+else:
+    df_asist["Fecha_base"] = pd.NaT
+
+# Inasistencias: usar Día
+if "Día" in df_inasist.columns:
+    df_inasist["Fecha_base"] = df_inasist["Día"].apply(try_parse_date_any)
+else:
+    df_inasist["Fecha_base"] = pd.NaT
+
+df_asist["Clave_RUT_Fecha_app"] = df_asist["RUT_norm"].astype(str) + "_" + df_asist["Fecha_base"].dt.strftime("%Y-%m-%d").fillna("")
+df_inasist["Clave_RUT_Fecha_app"] = df_inasist["RUT_norm"].astype(str) + "_" + df_inasist["Fecha_base"].dt.strftime("%Y-%m-%d").fillna("")
+df_act_long["Clave_RUT_Fecha_app"] = df_act_long["RUT_norm"].astype(str) + "_" + df_act_long["Fecha_dt"].dt.strftime("%Y-%m-%d").fillna("")
+
+# ------------------------
+# (Opcional) Filtrar por Área
+# ------------------------
+def maybe_filter_area(df, col="Área"):
+    if only_area and col in df.columns:
+        return df[df[col].astype(str).str.upper().str.contains(only_area.upper(), na=False)].copy()
+    return df
+
+df_act_long = maybe_filter_area(df_act_long, "Área")
+df_asist = maybe_filter_area(df_asist, "Área")
+df_inasist = maybe_filter_area(df_inasist, "Área")
+
+# ------------------------
+# Construcción Incidencias por comprobar (MVP)
+# ------------------------
+inc_rows = []
+
+# 1) Incidencias desde Asistencias (retrazo / salida anticipada / diff turno real)
+def get_num(df, col):
+    if col not in df.columns:
+        return pd.Series([0]*len(df))
+    return pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+df_asist["Retraso_h"] = get_num(df_asist, "Retraso (horas)")
+df_asist["SalidaAnt_h"] = get_num(df_asist, "Salida Anticipada (horas)")
+df_asist["DiffTurno_h"] = get_num(df_asist, "Diferencia Turno Real (horas)")
+
+mask_asist = (df_asist["Retraso_h"] > 0) | (df_asist["SalidaAnt_h"] > 0) | (df_asist["DiffTurno_h"] >= float(umbral_diff_turno))
+df_asist_inc = df_asist[mask_asist].copy()
+df_asist_inc["Fuente"] = "Asistencias PBI"
+df_asist_inc["Tipo_Incidencia"] = "Marcaje/Turno"
+# podrías desglosar aquí: Retraso vs Salida vs DiffTurno
+df_asist_inc["Detalle"] = (
+    "Retraso_h=" + df_asist_inc["Retraso_h"].astype(str) +
+    " | SalidaAnt_h=" + df_asist_inc["SalidaAnt_h"].astype(str) +
+    " | DiffTurno_h=" + df_asist_inc["DiffTurno_h"].astype(str)
 )
 
-# ---- UI: Reporte principal (por comprobar)
-st.subheader("1) Reporte Total de Incidencias por Comprobar")
-st.caption("Columna 'Comprobación Incidencia' por defecto en 'Indefinido'.")
+inc_rows.append(df_asist_inc[[
+    "Clave_RUT_Fecha_app", "RUT_norm", "Fecha_base", "Turno" if "Turno" in df_asist_inc.columns else df_asist_inc.columns[0],
+    "Especialidad" if "Especialidad" in df_asist_inc.columns else df_asist_inc.columns[0],
+    "Supervisor" if "Supervisor" in df_asist_inc.columns else df_asist_inc.columns[0],
+    "Fuente", "Tipo_Incidencia", "Detalle"
+]].rename(columns={ "RUT_norm":"RUT", "Fecha_base":"Fecha" }))
 
-# Editable table (guardado en session_state)
-if "incidencias_edit" not in st.session_state:
-    st.session_state["incidencias_edit"] = incidencias.copy()
+# 2) Incidencias desde Inasistencias PBI (cuando corresponda)
+# Regla MVP: tomar filas que existan como inasistencia (puedes refinar con Motivo vacío o específico)
+df_inasist_inc = df_inasist.copy()
+df_inasist_inc["Fuente"] = "Inasistencias PBI"
+df_inasist_inc["Tipo_Incidencia"] = "Inasistencia"
+motivo_col = "Motivo" if "Motivo" in df_inasist_inc.columns else None
+df_inasist_inc["Detalle"] = df_inasist_inc[motivo_col].astype(str) if motivo_col else ""
 
-edit_df = st.data_editor(
-    st.session_state["incidencias_edit"],
+inc_rows.append(df_inasist_inc[[
+    "Clave_RUT_Fecha_app", "RUT_norm", "Fecha_base",
+    "Turno" if "Turno" in df_inasist_inc.columns else df_inasist_inc.columns[0],
+    "Especialidad" if "Especialidad" in df_inasist_inc.columns else df_inasist_inc.columns[0],
+    "Supervisor" if "Supervisor" in df_inasist_inc.columns else df_inasist_inc.columns[0],
+    "Fuente", "Tipo_Incidencia", "Detalle"
+]].rename(columns={ "RUT_norm":"RUT", "Fecha_base":"Fecha" }))
+
+df_incidencias = pd.concat(inc_rows, ignore_index=True)
+
+# Join con turnos activos para validar si el turno estaba activo (y mostrarlo)
+df_incidencias = df_incidencias.merge(
+    df_act_long[["Clave_RUT_Fecha_app", "Turno_Activo"]].rename(columns={"Turno_Activo":"Turno_Activo_Base"}),
+    on="Clave_RUT_Fecha_app",
+    how="left"
+)
+
+# Columna clasificación manual
+if "Clasificación Manual" not in df_incidencias.columns:
+    df_incidencias["Clasificación Manual"] = "Indefinido"
+
+# Orden
+cols_order = [
+    "Clave_RUT_Fecha_app", "Fecha", "RUT",
+    "Turno_Activo_Base", "Turno",
+    "Especialidad", "Supervisor",
+    "Fuente", "Tipo_Incidencia", "Detalle",
+    "Clasificación Manual"
+]
+cols_order = [c for c in cols_order if c in df_incidencias.columns]
+df_incidencias = df_incidencias[cols_order].sort_values(["Fecha","RUT"], na_position="last")
+
+# ------------------------
+# UI: Reporte por comprobar + edición
+# ------------------------
+st.subheader("Reporte Total de Incidencias por Comprobar")
+
+col1, col2 = st.columns([2,1])
+with col2:
+    st.write("**Leyenda Clasificación Manual**")
+    st.caption("Indefinido (default) / Procede / No procede/Cambio Turno")
+
+edited = st.data_editor(
+    df_incidencias,
     use_container_width=True,
-    num_rows="fixed",
+    num_rows="dynamic",
     column_config={
-        "Comprobación Incidencia": st.column_config.SelectboxColumn(
-            "Comprobación Incidencia",
-            options=["Indefinido", "Procede", "No procede/Cambio turno"],
-            required=True,
+        "Clasificación Manual": st.column_config.SelectboxColumn(
+            options=["Indefinido", "Procede", "No procede/Cambio Turno"]
         )
-    },
+    }
 )
 
-st.session_state["incidencias_edit"] = edit_df
+# ------------------------
+# Resumen de incidencias comprobadas
+# ------------------------
+st.subheader("Reporte Incidencias por tipo (solo comprobadas: Procede)")
+df_ok = edited[edited["Clasificación Manual"] == "Procede"].copy()
 
-c1, c2 = st.columns(2)
-with c1:
-    st.download_button(
-        "⬇️ Descargar Incidencias (Excel)",
-        data=to_excel_bytes(edit_df, sheet_name="Incidencias_por_comprobar"),
-        file_name="incidencias_por_comprobar.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+if len(df_ok) == 0:
+    st.warning("Aún no hay incidencias marcadas como 'Procede'.")
+else:
+    resumen = (
+        df_ok.groupby(["Tipo_Incidencia"], dropna=False)
+            .size().reset_index(name="Cantidad")
+            .sort_values("Cantidad", ascending=False)
     )
-with c2:
-    st.download_button(
-        "⬇️ Descargar catálogo turnos normalizado",
-        data=to_excel_bytes(shift_catalog, sheet_name="CatalogoTurnos"),
-        file_name="catalogo_turnos.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    st.dataframe(resumen, use_container_width=True)
 
-st.divider()
-
-# ---- Outputs finales
-outputs = build_outputs(act_long, asist, edit_df)
-
-tabs = st.tabs([
-    "2) Incidencias por tipo (comprobadas)",
-    "3) Marcaje",
-    "4) Cumplimiento por trabajador",
-    "5) Ausentismo por trabajador",
-    "6) Asistencia diaria",
-])
-
-with tabs[0]:
-    st.subheader("2) Incidencias por tipo (solo 'Procede')")
-    st.dataframe(outputs["incidencias_por_tipo"], use_container_width=True)
-
-with tabs[1]:
-    st.subheader("3) Reporte de Marcaje")
-    st.dataframe(outputs["reporte_marcaje"], use_container_width=True)
-
-with tabs[2]:
-    st.subheader("4) Cumplimiento por Trabajador")
-    st.dataframe(outputs["cumplimiento_trabajador"], use_container_width=True)
-
-with tabs[3]:
-    st.subheader("5) Ausentismo por Trabajador")
-    st.dataframe(outputs["ausentismo_trabajador"], use_container_width=True)
-
-with tabs[4]:
-    st.subheader("6) Asistencia diaria (%), por Especialidad y General")
-    st.dataframe(outputs["asistencia_diaria"], use_container_width=True)
-
-st.divider()
-
-# Export pack
-st.subheader("📦 Descargar pack completo de reportes (Excel)")
-pack_bytes = to_excel_bytes(
-    outputs,
-    multi_sheet=True,
-    filename_hint="pack_reportes.xlsx",
-)
+# ------------------------
+# Export
+# ------------------------
+st.subheader("Descarga")
+excel_bytes = to_excel_bytes({
+    "Incidencias_por_comprobar": edited,
+    "Resumen_procede": (resumen if len(df_ok) else pd.DataFrame())
+})
 st.download_button(
-    "⬇️ Descargar pack",
-    data=pack_bytes,
-    file_name="pack_reportes.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
+    "Descargar Excel consolidado",
+    data=excel_bytes,
+    file_name="reporte_incidencias_consolidado.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
