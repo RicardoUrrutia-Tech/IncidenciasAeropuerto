@@ -1,47 +1,37 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from io import BytesIO
+from datetime import date
 
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.datavalidation import DataValidation
 
+
+# =========================
+# Config
+# =========================
 st.set_page_config(page_title="Incidencias / Ausentismo / Asistencia", layout="wide")
 st.title("App Incidencias / Ausentismo / Asistencia")
 
-# =========================
-# Constantes / Estilo
-# =========================
-CABIFY = {
-    "m1": "1F123F",
-    "m2": "362065",
-    "m3": "4A2B8D",
-    "m4": "5B34AC",
-    "m5": "7145D6",
-    "m6": "8A6EE4",
-    "m7": "A697ED",
-    "m8": "C4BDF5",
-    "m9": "DFDAF8",
-    "m10": "F5F1FC",
-    "m11": "FAF8FE",
-    "pink": "E83C96",
-    "red": "E74A41",
-    "orange": "EA8C2E",
-    "yellow": "EFBD03",
-    "blue": "4583D4",
-    "green": "0C936B",  # ojo: era "OC936B" pero debe ser 0 (cero)
-}
-
-CLASIF_OPTS = ["Seleccionar", "Injustificada", "Permiso", "No Procede - Cambio de Turno"]
 
 # =========================
 # Helpers
 # =========================
+CABIFY_PURPLE = "1F123F"
+CABIFY_LIGHT = "F5F1FC"
+
+DROPDOWN_OPTS = ["Seleccionar", "Injustificada", "Permiso", "No Procede - Cambio de Turno"]
+
 def normalize_rut(x) -> str:
     if pd.isna(x):
         return ""
-    return str(x).strip().upper().replace(".", "").replace(" ", "")
+    s = str(x).strip().upper()
+    s = s.replace(".", "").replace(" ", "")
+    # deja el guión si existe
+    return s
 
 def try_parse_date_any(x):
     if pd.isna(x):
@@ -51,491 +41,491 @@ def try_parse_date_any(x):
 def excel_to_df(file, sheet_index=0):
     return pd.read_excel(file, sheet_name=sheet_index, engine="openpyxl")
 
-def find_col(df: pd.DataFrame, candidates):
-    norm_map = {str(c).strip().lower(): c for c in df.columns}
-    for cand in candidates:
-        key = str(cand).strip().lower()
-        if key in norm_map:
-            return norm_map[key]
-    return None
+def safe_col(df: pd.DataFrame, name: str):
+    return name if name in df.columns else None
 
-def get_num(df, candidates):
-    col = find_col(df, candidates if isinstance(candidates, list) else [candidates])
-    if not col:
-        return pd.Series([0.0] * len(df))
-    return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+def as_num(series):
+    return pd.to_numeric(series, errors="coerce").fillna(0)
 
-def safe_text_series(df, candidates, default=""):
-    col = find_col(df, candidates)
-    if not col:
-        return pd.Series([default] * len(df))
-    return df[col].astype(str).fillna(default)
+def maybe_filter_area(df: pd.DataFrame, only_area: str, col="Área"):
+    if only_area and col in df.columns:
+        return df[df[col].astype(str).str.upper().str.contains(only_area.upper(), na=False)].copy()
+    return df
 
-def maybe_filter_area(df, only_area: str):
-    if not only_area:
-        return df
-    area_col = find_col(df, ["Área", "Area", "AREA"])
-    if not area_col:
-        return df
-    return df[df[area_col].astype(str).str.upper().str.contains(only_area.upper(), na=False)].copy()
+def get_date_range_from_data(dfs_dates):
+    all_dates = pd.concat([s.dropna() for s in dfs_dates], ignore_index=True)
+    if all_dates.empty:
+        return None, None
+    return all_dates.min().date(), all_dates.max().date()
+
 
 # =========================
-# Excel builder (dinámico)
-# =========================
-def style_ws_cabify(ws):
-    header_fill = PatternFill("solid", fgColor=CABIFY["m4"])
-    header_font = Font(color="FFFFFF", bold=True)
-    body_fill = PatternFill("solid", fgColor=CABIFY["m11"])
-    alt_fill = PatternFill("solid", fgColor=CABIFY["m10"])
-
-    thin = Side(style="thin", color=CABIFY["m7"])
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    for row_idx, row in enumerate(ws.iter_rows(), start=1):
-        for cell in row:
-            cell.border = border
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-            if row_idx == 1:
-                cell.fill = header_fill
-                cell.font = header_font
-            else:
-                cell.fill = alt_fill if (row_idx % 2 == 0) else body_fill
-
-    # ancho automático simple
-    for col in ws.columns:
-        max_len = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            v = "" if cell.value is None else str(cell.value)
-            max_len = max(max_len, len(v))
-        ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 55)
-
-    ws.freeze_panes = "A2"
-
-def write_df_to_sheet(wb, sheet_name, df: pd.DataFrame):
-    ws = wb.create_sheet(title=sheet_name[:31])
-    for r in dataframe_to_rows(df, index=False, header=True):
-        ws.append(r)
-    return ws
-
-def set_date_format(ws, df_cols, col_name="Fecha"):
-    if col_name not in df_cols:
-        return
-    idx = list(df_cols).index(col_name) + 1
-    for r in range(2, ws.max_row + 1):
-        c = ws.cell(row=r, column=idx)
-        c.number_format = "dd-mm-yyyy"
-
-def add_list_sheet(wb):
-    ws = wb.create_sheet(title="Listas")
-    ws["A1"] = "Clasificación Manual"
-    for i, opt in enumerate(CLASIF_OPTS, start=2):
-        ws[f"A{i}"] = opt
-    style_ws_cabify(ws)
-    ws.column_dimensions["A"].width = 35
-    return ws
-
-def apply_dropdown_range(ws_target, col_letter, start_row, end_row, list_ws_name="Listas", list_range="A2:A5"):
-    # Data Validation con referencia a rango (mejor para Google Sheets)
-    dv = DataValidation(
-        type="list",
-        formula1=f"={list_ws_name}!${list_range.split(':')[0]}:${list_range.split(':')[1]}",
-        allow_blank=False
-    )
-    dv.add(f"{col_letter}{start_row}:{col_letter}{end_row}")
-    ws_target.add_data_validation(dv)
-
-def build_resumen_sheet(wb, incidencias_ws_name="Incidencias"):
-    ws = wb.create_sheet(title="Resumen")
-    headers = ["Tipo_Incidencia", "Cantidad Injustificada", "Cantidad Permiso", "Cantidad No Procede - Cambio de Turno", "Total"]
-    ws.append(headers)
-
-    tipos = ["Marcaje/Turno", "Inasistencia"]
-    # Asumimos columnas en Incidencias: Tipo_Incidencia (I), Clasificación Manual (K)
-    # Pero para no depender de letras fijas, definimos aquí en base a nuestro dataframe exportado:
-    # Fecha(A), Nombre(B), Primer Apellido(C), Segundo Apellido(D), RUT(E), Turno(F),
-    # Especialidad(G), Supervisor(H), Tipo_Incidencia(I), Detalle(J), Clasificación Manual(K)
-
-    for t in tipos:
-        row = [t]
-        # COUNTIFS(Incidencias!$I:$I,"Marcaje/Turno",Incidencias!$K:$K,"Injustificada")
-        row.append(f'=COUNTIFS({incidencias_ws_name}!$I:$I,"{t}",{incidencias_ws_name}!$K:$K,"Injustificada")')
-        row.append(f'=COUNTIFS({incidencias_ws_name}!$I:$I,"{t}",{incidencias_ws_name}!$K:$K,"Permiso")')
-        row.append(f'=COUNTIFS({incidencias_ws_name}!$I:$I,"{t}",{incidencias_ws_name}!$K:$K,"No Procede - Cambio de Turno")')
-        row.append("=SUM(B{r}:D{r})".format(r=ws.max_row + 1))
-        ws.append(row)
-
-    # Total general
-    ws.append(["TOTAL",
-               f"=SUM(B2:B{1+len(tipos)})",
-               f"=SUM(C2:C{1+len(tipos)})",
-               f"=SUM(D2:D{1+len(tipos)})",
-               f"=SUM(E2:E{1+len(tipos)})"])
-    style_ws_cabify(ws)
-    return ws
-
-def build_cumplimiento_sheet(wb, turnos_df: pd.DataFrame, incidencias_ws_name="Incidencias"):
-    """
-    turnos_df debe traer:
-    - RUT_norm (sin puntos)
-    - Turnos_planificados
-    - Nombre, Primer Apellido, Segundo Apellido (opcional)
-    Dejamos fórmulas que cuentan injustificadas por RUT en hoja Incidencias y calculan %.
-    """
-    ws = wb.create_sheet(title="Cumplimiento")
-
-    headers = [
-        "Nombre", "Primer Apellido", "Segundo Apellido",
-        "RUT_norm", "Turnos_planificados",
-        "Injustificadas",
-        "Cumplimiento_%"
-    ]
-    ws.append(headers)
-
-    # Incidencias: RUT está en E, Clasificación Manual en K
-    for _, r in turnos_df.iterrows():
-        nombre = r.get("Nombre", "")
-        pa = r.get("Primer Apellido", "")
-        sa = r.get("Segundo Apellido", "")
-        rut_norm = r.get("RUT_norm", "")
-        turnos = int(r.get("Turnos_planificados", 0)) if pd.notna(r.get("Turnos_planificados", 0)) else 0
-
-        next_row = ws.max_row + 1
-        ws.append([nombre, pa, sa, rut_norm, turnos, "", ""])
-
-        # Injustificadas: COUNTIFS(Incidencias!$E:$E, rut_norm_con_puntos? -> en Incidencias guardamos RUT original con puntos)
-        # Para hacerlo robusto, en Incidencias agregamos también una columna "RUT_norm" NO (no la quieres visible).
-        # Como NO la quieres en export, aquí contamos por coincidencia parcial en texto: sustituimos puntos/guión sería ideal, pero Excel no es lindo.
-        # Solución práctica: contamos por coincidencia "contiene" no es posible con COUNTIFS.
-        # Por eso en Incidencias exportaremos RUT "normalizado" en una columna oculta NO; entonces en Excel podemos contar exacto.
-        # (Esa columna la ocultamos en el Excel final, no aparece para el usuario, pero habilita fórmulas.)
-        # => En el export pondremos columna "RUT_norm_hidden" al final y la ocultamos.
-        ws.cell(row=next_row, column=6).value = f'=COUNTIFS({incidencias_ws_name}!$L:$L, "{rut_norm}", {incidencias_ws_name}!$K:$K, "Injustificada")'
-        # Cumplimiento_% = MAX(0, (1 - Injustificadas/Turnos_planificados) * 100)
-        ws.cell(row=next_row, column=7).value = f'=IFERROR(MAX(0,(1 - F{next_row}/E{next_row})*100),100)'
-
-    style_ws_cabify(ws)
-    ws.column_dimensions["D"].width = 16
-    ws.column_dimensions["E"].width = 18
-    ws.column_dimensions["F"].width = 14
-    ws.column_dimensions["G"].width = 16
-    return ws
-
-def to_excel_bytes_dynamic(incidencias_df: pd.DataFrame, turnos_base_df: pd.DataFrame):
-    """
-    Crea Excel con:
-    - Listas (dropdown)
-    - Incidencias (editable + dropdown + fecha)
-    - Resumen (fórmulas)
-    - Cumplimiento (fórmulas)
-    """
-    output = BytesIO()
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    ws_list = add_list_sheet(wb)
-
-    # Incidencias
-    ws_inc = write_df_to_sheet(wb, "Incidencias", incidencias_df)
-    set_date_format(ws_inc, incidencias_df.columns, "Fecha")
-
-    # Dropdown en Clasificación Manual (col K)
-    if "Clasificación Manual" in incidencias_df.columns:
-        idx = list(incidencias_df.columns).index("Clasificación Manual") + 1
-        col_letter = ws_inc.cell(row=1, column=idx).column_letter
-        end_row = max(2, ws_inc.max_row)
-        apply_dropdown_range(ws_inc, col_letter, 2, end_row, list_ws_name="Listas", list_range="A2:A5")
-
-    style_ws_cabify(ws_inc)
-
-    # Resumen (fórmulas)
-    ws_res = build_resumen_sheet(wb, incidencias_ws_name="Incidencias")
-
-    # Cumplimiento (fórmulas)
-    ws_cump = build_cumplimiento_sheet(wb, turnos_base_df, incidencias_ws_name="Incidencias")
-
-    # Ocultar hoja Listas (pero queda para validación)
-    ws_list.sheet_state = "hidden"
-
-    # Ocultar la columna RUT_norm_hidden en Incidencias si existe (col L)
-    if "RUT_norm_hidden" in incidencias_df.columns:
-        idx = list(incidencias_df.columns).index("RUT_norm_hidden") + 1
-        col_letter = ws_inc.cell(row=1, column=idx).column_letter
-        ws_inc.column_dimensions[col_letter].hidden = True
-
-    wb.save(output)
-    output.seek(0)
-    return output
-
-# =========================
-# UI Inputs
+# Sidebar inputs
 # =========================
 with st.sidebar:
     st.header("Cargar archivos (Excel)")
-    f_turnos = st.file_uploader("1) Codificación Turnos BUK", type=["xlsx"])
-    f_reporte_turnos = st.file_uploader("2) Reporte Turnos (Activos + Turnos)", type=["xlsx"])
+
+    f_turnos_cod = st.file_uploader("1) Codificación Turnos BUK", type=["xlsx"])
+    f_turnos_colab = st.file_uploader("2) Turnos Colaboradores (Activos + Turnos)", type=["xlsx"])
     f_detalle = st.file_uploader("3) Detalle Turnos Colaboradores (Hoja1=Inasistencias, Hoja2=Asistencias)", type=["xlsx"])
 
     st.divider()
-    st.subheader("Filtros")
+    st.subheader("Filtros / Reglas")
+
     only_area = st.text_input("Filtrar Área (opcional)", value="AEROPUERTO")
-    min_horas = st.number_input(
+    st.caption("Déjalo vacío para no filtrar.")
+
+    min_inc_hours = st.number_input(
         "Tiempo mínimo de incidencia (horas)",
-        min_value=0.0,
-        value=0.0,
-        step=0.25,
-        help="Se aplica a asistencias: (Retraso + Salida Anticipada) >= este umbral."
+        min_value=0.0, value=0.0, step=0.25,
+        help="Se considera incidencia solo si (Retraso + Salida Anticipada) >= este umbral."
     )
 
-if not all([f_turnos, f_reporte_turnos, f_detalle]):
+if not all([f_turnos_cod, f_turnos_colab, f_detalle]):
     st.info("Sube los 3 archivos para comenzar.")
     st.stop()
 
-# =========================
-# Load
-# =========================
-df_turnos = excel_to_df(f_turnos, 0)  # queda para reglas futuras (mapeo sigla-horario, etc.)
-df_activos = excel_to_df(f_reporte_turnos, 0)
-
-# Detalle Turnos Colaboradores:
-df_inasist = excel_to_df(f_detalle, 0)  # Hoja 1
-df_asist = excel_to_df(f_detalle, 1)    # Hoja 2
 
 # =========================
-# Normalización columnas
+# Load data
 # =========================
-rut_col_inas = find_col(df_inasist, ["RUT", "Rut", "rut"])
-rut_col_as = find_col(df_asist, ["RUT", "Rut", "rut"])
+df_cod = excel_to_df(f_turnos_cod, 0)
+df_turnos = excel_to_df(f_turnos_colab, 0)
 
-if not rut_col_inas or not rut_col_as:
-    st.error("No pude detectar la columna RUT en una de las hojas del 'Detalle Turnos Colaboradores'.")
-    st.stop()
+# Detalle: Hoja1=Inasistencias, Hoja2=Asistencias (tal como tu Excel real)
+df_inasist = excel_to_df(f_detalle, 0)
+df_asist = excel_to_df(f_detalle, 1)
 
-df_inasist["RUT_norm"] = df_inasist[rut_col_inas].apply(normalize_rut)
-df_asist["RUT_norm"] = df_asist[rut_col_as].apply(normalize_rut)
+# Normalizaciones básicas
+for df in [df_turnos, df_inasist, df_asist]:
+    if "RUT" in df.columns:
+        df["RUT_norm"] = df["RUT"].apply(normalize_rut)
 
-# Fechas base
-dia_col_inas = find_col(df_inasist, ["Día", "Dia", "DIA", "día"])
-df_inasist["Fecha_base"] = df_inasist[dia_col_inas].apply(try_parse_date_any) if dia_col_inas else pd.NaT
+# Parse fechas base
+# Inasistencias: Día
+if "Día" in df_inasist.columns:
+    df_inasist["Fecha_base"] = df_inasist["Día"].apply(try_parse_date_any)
+else:
+    df_inasist["Fecha_base"] = pd.NaT
 
-fecha_ent_col_as = find_col(df_asist, ["Fecha Entrada", "Fecha_Entrada", "Fecha entrada"])
-dia_col_as = find_col(df_asist, ["Día", "Dia", "DIA", "día"])
-if fecha_ent_col_as:
-    df_asist["Fecha_base"] = df_asist[fecha_ent_col_as].apply(try_parse_date_any)
-elif dia_col_as:
-    df_asist["Fecha_base"] = df_asist[dia_col_as].apply(try_parse_date_any)
+# Asistencias: Fecha Entrada
+if "Fecha Entrada" in df_asist.columns:
+    df_asist["Fecha_base"] = df_asist["Fecha Entrada"].apply(try_parse_date_any)
+elif "Día" in df_asist.columns:
+    df_asist["Fecha_base"] = df_asist["Día"].apply(try_parse_date_any)
 else:
     df_asist["Fecha_base"] = pd.NaT
 
-# Filtrar Área
-df_inasist = maybe_filter_area(df_inasist, only_area)
-df_asist = maybe_filter_area(df_asist, only_area)
+# Filtrar por área (si aplica)
+df_turnos = maybe_filter_area(df_turnos, only_area, "Área")
+df_inasist = maybe_filter_area(df_inasist, only_area, "Área")
+df_asist = maybe_filter_area(df_asist, only_area, "Área")
+
 
 # =========================
-# Turnos planificados (Activos + Turnos) para base cumplimiento
+# Turnos (formato ancho -> largo) para planificados
 # =========================
-# Asegurar columna RUT
-if "RUT" not in df_activos.columns:
-    rut_col_act = find_col(df_activos, ["RUT", "Rut", "rut"])
-    if rut_col_act and rut_col_act != "RUT":
-        df_activos = df_activos.rename(columns={rut_col_act: "RUT"})
+fixed_cols = [c for c in ["Nombre del Colaborador", "RUT", "Área", "Supervisor"] if c in df_turnos.columns]
+date_cols = [c for c in df_turnos.columns if c not in fixed_cols]
 
-fixed_cols = [c for c in ["Nombre del Colaborador", "RUT", "Área", "Supervisor"] if c in df_activos.columns]
-date_cols = [c for c in df_activos.columns if c not in fixed_cols]
-
-df_act_long = df_activos.melt(
-    id_vars=[c for c in fixed_cols if c in df_activos.columns],
+df_turnos_long = df_turnos.melt(
+    id_vars=fixed_cols,
     value_vars=date_cols,
     var_name="Fecha",
-    value_name="Turno_planificado"
+    value_name="Turno_Activo"
 )
-df_act_long["Fecha_dt"] = df_act_long["Fecha"].apply(try_parse_date_any)
-df_act_long["RUT_norm"] = df_act_long["RUT"].apply(normalize_rut) if "RUT" in df_act_long.columns else ""
-df_act_long["Turno_planificado"] = df_act_long["Turno_planificado"].astype(str).str.strip()
-df_act_long.loc[df_act_long["Turno_planificado"].isin(["", "nan", "NaT", "None", "-"]), "Turno_planificado"] = ""
+
+df_turnos_long["Fecha_dt"] = df_turnos_long["Fecha"].apply(try_parse_date_any)
+df_turnos_long["RUT_norm"] = df_turnos_long["RUT"].apply(normalize_rut) if "RUT" in df_turnos_long.columns else ""
+
+df_turnos_long["Turno_Activo"] = df_turnos_long["Turno_Activo"].astype(str).str.strip()
+df_turnos_long.loc[df_turnos_long["Turno_Activo"].isin(["", "nan", "NaT", "None"]), "Turno_Activo"] = ""
+
+# Turnos activos para cumplimiento: NO vacíos, NO L, NO "-", NO LIBRE
+def is_planned_turno(x: str) -> bool:
+    if x is None:
+        return False
+    s = str(x).strip().upper()
+    if s in ["", "L", "-", "LIBRE"]:
+        return False
+    return True
+
+df_turnos_long["Es_Turno_Planificado"] = df_turnos_long["Turno_Activo"].apply(is_planned_turno)
+
 
 # =========================
-# Construcción Incidencias (con filtros)
-# Campos requeridos:
-# Fecha, Nombre, Primer Apellido, Segundo Apellido, RUT, Turno, Especialidad,
-# Supervisor, Tipo_Incidencia, Detalle, Clasificación Manual
+# Rango de fechas (selector)
 # =========================
-inc_rows = []
+min_d, max_d = get_date_range_from_data([df_inasist["Fecha_base"], df_asist["Fecha_base"], df_turnos_long["Fecha_dt"]])
 
-# 1) Asistencias: SOLO si hay incidencia (Retraso o Salida) y cumple mínimo de horas (sum)
-retr = get_num(df_asist, ["Retraso (horas)", "Retraso horas", "Retraso"])
-sal = get_num(df_asist, ["Salida Anticipada (horas)", "Salida Anticipada", "Salida anticipada (horas)"])
-suma = retr + sal
+with st.sidebar:
+    st.subheader("Rango de fechas")
+    if min_d and max_d:
+        date_start, date_end = st.date_input(
+            "Selecciona desde / hasta",
+            value=(min_d, max_d),
+            min_value=min_d,
+            max_value=max_d,
+        )
+    else:
+        st.warning("No pude inferir fechas desde los archivos. Revisar columnas de fecha.")
+        st.stop()
 
-mask_asist = ((retr > 0) | (sal > 0)) & (suma >= float(min_horas))
+# Normalizar por si streamlit devuelve 1 fecha
+if isinstance(date_start, tuple) or isinstance(date_start, list):
+    date_start, date_end = date_start
 
+dt_start = pd.to_datetime(date_start)
+dt_end = pd.to_datetime(date_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+df_asist = df_asist[(df_asist["Fecha_base"] >= dt_start) & (df_asist["Fecha_base"] <= dt_end)].copy()
+df_inasist = df_inasist[(df_inasist["Fecha_base"] >= dt_start) & (df_inasist["Fecha_base"] <= dt_end)].copy()
+df_turnos_long = df_turnos_long[(df_turnos_long["Fecha_dt"] >= dt_start) & (df_turnos_long["Fecha_dt"] <= dt_end)].copy()
+
+
+# =========================
+# Incidencias desde ASISTENCIAS
+# Regla: SOLO si existe Retraso o Salida Anticipada
+# y (Retraso + Salida) >= min_inc_hours
+# =========================
+col_retraso = safe_col(df_asist, "Retraso (horas)")
+col_salida = safe_col(df_asist, "Salida Anticipada (horas)")
+
+if not col_retraso or not col_salida:
+    st.error("En Asistencias falta 'Retraso (horas)' o 'Salida Anticipada (horas)'.")
+    st.stop()
+
+df_asist["Retraso_h"] = as_num(df_asist[col_retraso])
+df_asist["SalidaAnt_h"] = as_num(df_asist[col_salida])
+df_asist["Inc_total_h"] = df_asist["Retraso_h"] + df_asist["SalidaAnt_h"]
+
+mask_asist = (df_asist["Inc_total_h"] > 0) & (df_asist["Inc_total_h"] >= float(min_inc_hours))
 df_asist_inc = df_asist[mask_asist].copy()
-
-df_asist_inc["Fecha"] = df_asist_inc["Fecha_base"].dt.date
-df_asist_inc["Nombre"] = safe_text_series(df_asist_inc, ["Nombre"], "")
-df_asist_inc["Primer Apellido"] = safe_text_series(df_asist_inc, ["Primer Apellido", "Primer apellido"], "")
-df_asist_inc["Segundo Apellido"] = safe_text_series(df_asist_inc, ["Segundo Apellido", "Segundo apellido"], "")
-df_asist_inc["RUT"] = df_asist_inc[rut_col_as].astype(str)
-df_asist_inc["Turno"] = safe_text_series(df_asist_inc, ["Turno"], "")
-df_asist_inc["Especialidad"] = safe_text_series(df_asist_inc, ["Especialidad"], "")
-df_asist_inc["Supervisor"] = safe_text_series(df_asist_inc, ["Supervisor"], "")
 
 df_asist_inc["Tipo_Incidencia"] = "Marcaje/Turno"
 df_asist_inc["Detalle"] = (
-    "Retraso_h=" + retr[mask_asist].astype(str).values
-    + " | SalidaAnt_h=" + sal[mask_asist].astype(str).values
-    + " | Total_h=" + suma[mask_asist].astype(str).values
+    "Retraso_h=" + df_asist_inc["Retraso_h"].round(2).astype(str) +
+    " | SalidaAnt_h=" + df_asist_inc["SalidaAnt_h"].round(2).astype(str)
 )
 
-df_asist_inc["Clasificación Manual"] = "Seleccionar"
+# Campos de salida (los que tú pediste)
+# Fecha, Nombre, Primer Apellido, Segundo Apellido, RUT, Turno, Especialidad, Supervisor, Tipo_Incidencia, Detalle, Clasificación Manual
+def pick(df, col, default=""):
+    return df[col] if col in df.columns else default
 
-inc_rows.append(df_asist_inc[[
-    "Fecha", "Nombre", "Primer Apellido", "Segundo Apellido", "RUT",
-    "Turno", "Especialidad", "Supervisor",
-    "Tipo_Incidencia", "Detalle", "Clasificación Manual"
-]])
+out_asist = pd.DataFrame({
+    "Fecha": df_asist_inc["Fecha_base"],
+    "Nombre": pick(df_asist_inc, "Nombre", ""),
+    "Primer Apellido": pick(df_asist_inc, "Primer Apellido", ""),
+    "Segundo Apellido": pick(df_asist_inc, "Segundo Apellido", ""),
+    "RUT": df_asist_inc["RUT"],
+    "Turno": pick(df_asist_inc, "Turno", ""),
+    "Especialidad": pick(df_asist_inc, "Especialidad", ""),
+    "Supervisor": pick(df_asist_inc, "Supervisor", ""),
+    "Tipo_Incidencia": df_asist_inc["Tipo_Incidencia"],
+    "Detalle": df_asist_inc["Detalle"],
+    "Clasificación Manual": "Seleccionar",
+})
 
-# 2) Inasistencias: se listan para clasificar manualmente (no aplica umbral de horas)
-df_inasist_inc = df_inasist.copy()
-df_inasist_inc["Fecha"] = df_inasist_inc["Fecha_base"].dt.date
-df_inasist_inc["Nombre"] = safe_text_series(df_inasist_inc, ["Nombre"], "")
-df_inasist_inc["Primer Apellido"] = safe_text_series(df_inasist_inc, ["Primer Apellido", "Primer apellido"], "")
-df_inasist_inc["Segundo Apellido"] = safe_text_series(df_inasist_inc, ["Segundo Apellido", "Segundo apellido"], "")
-df_inasist_inc["RUT"] = df_inasist_inc[rut_col_inas].astype(str)
-df_inasist_inc["Turno"] = safe_text_series(df_inasist_inc, ["Turno"], "")
-df_inasist_inc["Especialidad"] = safe_text_series(df_inasist_inc, ["Especialidad"], "")
-df_inasist_inc["Supervisor"] = safe_text_series(df_inasist_inc, ["Supervisor"], "")
-
-mot = safe_text_series(df_inasist_inc, ["Motivo"], "")
-df_inasist_inc["Tipo_Incidencia"] = "Inasistencia"
-df_inasist_inc["Detalle"] = "Motivo=" + mot
-df_inasist_inc["Clasificación Manual"] = "Seleccionar"
-
-inc_rows.append(df_inasist_inc[[
-    "Fecha", "Nombre", "Primer Apellido", "Segundo Apellido", "RUT",
-    "Turno", "Especialidad", "Supervisor",
-    "Tipo_Incidencia", "Detalle", "Clasificación Manual"
-]])
-
-df_incidencias = pd.concat(inc_rows, ignore_index=True)
-
-# Fechas a datetime para filtros + orden
-df_incidencias["Fecha"] = pd.to_datetime(df_incidencias["Fecha"], errors="coerce")
 
 # =========================
-# Selector de fechas (rango)
+# Inasistencias (Hoja1) - solo Motivo "-" o vacío (inasistencia preliminar injustificada)
 # =========================
-min_fecha = df_incidencias["Fecha"].min()
-max_fecha = df_incidencias["Fecha"].max()
+motivo_col = safe_col(df_inasist, "Motivo")
+if motivo_col:
+    motivo = df_inasist[motivo_col].astype(str).str.strip()
+    mask_inas = motivo.isna() | (motivo == "") | (motivo == "-")
+else:
+    mask_inas = pd.Series([True]*len(df_inasist))
 
-with st.sidebar:
-    st.divider()
-    st.subheader("Rango de fechas")
-    if pd.isna(min_fecha) or pd.isna(max_fecha):
-        date_range = None
-        st.caption("No se detectaron fechas válidas.")
-    else:
-        default_start = min_fecha.date()
-        default_end = max_fecha.date()
-        date_range = st.date_input(
-            "Desde / Hasta",
-            value=(default_start, default_end),
-            min_value=default_start,
-            max_value=default_end
-        )
+df_inas_inc = df_inasist[mask_inas].copy()
+df_inas_inc["Tipo_Incidencia"] = "Inasistencia"
 
-if date_range and isinstance(date_range, tuple) and len(date_range) == 2:
-    d1, d2 = date_range
-    mask_dates = (df_incidencias["Fecha"].dt.date >= d1) & (df_incidencias["Fecha"].dt.date <= d2)
-    df_incidencias = df_incidencias[mask_dates].copy()
+out_inas = pd.DataFrame({
+    "Fecha": df_inas_inc["Fecha_base"],
+    "Nombre": pick(df_inas_inc, "Nombre", ""),
+    "Primer Apellido": pick(df_inas_inc, "Primer Apellido", ""),
+    "Segundo Apellido": pick(df_inas_inc, "Segundo Apellido", ""),
+    "RUT": df_inas_inc["RUT"],
+    "Turno": pick(df_inas_inc, "Turno", ""),
+    "Especialidad": pick(df_inas_inc, "Especialidad", ""),
+    "Supervisor": pick(df_inas_inc, "Supervisor", ""),
+    "Tipo_Incidencia": df_inas_inc["Tipo_Incidencia"],
+    "Detalle": (df_inas_inc[motivo_col].astype(str) if motivo_col else ""),
+    "Clasificación Manual": "Seleccionar",
+})
 
-df_incidencias = df_incidencias.sort_values(["Fecha", "RUT"], na_position="last").reset_index(drop=True)
 
 # =========================
-# UI: Editor + resumen (dinámico en la app)
+# Consolidado Detalle
 # =========================
-st.subheader("Detalle (Incidencias por comprobar)")
+df_detalle = pd.concat([out_asist, out_inas], ignore_index=True)
+
+# Normalizar RUT para cruces
+df_detalle["RUT_norm"] = df_detalle["RUT"].apply(normalize_rut)
+
+# Orden / formato
+df_detalle["Fecha"] = pd.to_datetime(df_detalle["Fecha"], errors="coerce")
+df_detalle = df_detalle.sort_values(["Fecha", "RUT_norm"], na_position="last").reset_index(drop=True)
+
+# Vista corta de fecha en pantalla
+df_detalle_view = df_detalle.copy()
+df_detalle_view["Fecha"] = df_detalle_view["Fecha"].dt.date
+
+
+# =========================
+# Editor (y resumen dinámico en app)
+# =========================
+st.subheader("Detalle de Incidencias por Comprobar")
 
 edited = st.data_editor(
-    df_incidencias,
+    df_detalle_view.drop(columns=["RUT_norm"], errors="ignore"),
     use_container_width=True,
-    num_rows="dynamic",
     column_config={
-        "Fecha": st.column_config.DateColumn(format="DD-MM-YYYY"),
         "Clasificación Manual": st.column_config.SelectboxColumn(
-            options=CLASIF_OPTS,
-            required=True
-        ),
-    },
-    key="editor_incidencias"
+            options=DROPDOWN_OPTS
+        )
+    }
 )
 
-st.subheader("Resumen dinámico (solo Injustificada)")
-df_inj = edited[edited["Clasificación Manual"] == "Injustificada"].copy()
+# Resumen dinámico (se recalcula con lo editado)
+st.subheader("Resumen dinámico (en base a lo editado)")
 
-if df_inj.empty:
-    st.info("Aún no hay registros clasificados como 'Injustificada'.")
-    resumen_app = pd.DataFrame(columns=["Tipo_Incidencia", "Cantidad"])
-else:
-    resumen_app = (
-        df_inj.groupby(["Tipo_Incidencia"], dropna=False)
-              .size()
-              .reset_index(name="Cantidad")
-              .sort_values("Cantidad", ascending=False)
-    )
-    st.dataframe(resumen_app, use_container_width=True)
+edited_calc = edited.copy()
+edited_calc["Fecha"] = pd.to_datetime(edited_calc["Fecha"], errors="coerce")
+resumen = (
+    edited_calc.groupby(["Tipo_Incidencia", "Clasificación Manual"], dropna=False)
+    .size().reset_index(name="Cantidad")
+    .sort_values("Cantidad", ascending=False)
+)
+st.dataframe(resumen, use_container_width=True)
+
 
 # =========================
-# Base Cumplimiento (para Excel dinámico)
-# - Turnos planificados por RUT_norm (no vacíos)
-# - Traer nombre/apellidos desde incidencias (si existe)
+# Cumplimiento (TODOS los trabajadores del reporte de turnos)
+# planned_turnos = conteo de fechas con turno planificado (no L / no vacío) en el rango
+# unjustified = incidencias clasificadas como "Injustificada"
+# cumplimiento = 1 - unjustified / planned_turnos  (si planned_turnos==0 => 1.0)
 # =========================
-df_act_long_valid = df_act_long[df_act_long["Turno_planificado"] != ""].copy()
-turnos_plan = (
-    df_act_long_valid.groupby("RUT_norm")
+workers_cols = [c for c in ["Nombre del Colaborador", "RUT", "Supervisor", "Área"] if c in df_turnos.columns]
+df_workers = df_turnos[workers_cols].drop_duplicates().copy()
+df_workers["RUT_norm"] = df_workers["RUT"].apply(normalize_rut)
+
+planned = (
+    df_turnos_long[df_turnos_long["Es_Turno_Planificado"]]
+    .groupby("RUT_norm", as_index=False)
+    .agg(Turnos_Planificados=("Es_Turno_Planificado", "size"))
+)
+
+# injustificadas desde lo EDITADO (en app)
+edited_for_comp = edited.copy()
+edited_for_comp["RUT_norm"] = edited_for_comp["RUT"].apply(normalize_rut)
+
+unjust = (
+    edited_for_comp[edited_for_comp["Clasificación Manual"] == "Injustificada"]
+    .groupby("RUT_norm", as_index=False)
     .size()
-    .reset_index(name="Turnos_planificados")
+    .rename(columns={"size": "Inc_Injustificadas"})
 )
 
-# Nombre/apellidos desde lo editado (para poblar Cumplimiento)
-tmp = edited.copy()
-tmp["RUT_norm"] = tmp["RUT"].apply(normalize_rut)
-name_map = (
-    tmp.dropna(subset=["RUT_norm"])
-       .drop_duplicates("RUT_norm")[["RUT_norm", "Nombre", "Primer Apellido", "Segundo Apellido"]]
+df_cump = df_workers.merge(planned, on="RUT_norm", how="left").merge(unjust, on="RUT_norm", how="left")
+df_cump["Turnos_Planificados"] = df_cump["Turnos_Planificados"].fillna(0).astype(int)
+df_cump["Inc_Injustificadas"] = df_cump["Inc_Injustificadas"].fillna(0).astype(int)
+
+df_cump["Cumplimiento_pct"] = np.where(
+    df_cump["Turnos_Planificados"] > 0,
+    (1 - (df_cump["Inc_Injustificadas"] / df_cump["Turnos_Planificados"])) * 100,
+    100.0
+)
+df_cump["Cumplimiento_pct"] = df_cump["Cumplimiento_pct"].clip(lower=0).round(2)
+
+st.subheader("Cumplimiento (vista en app)")
+st.dataframe(
+    df_cump[["Nombre del Colaborador", "RUT", "Supervisor", "Turnos_Planificados", "Inc_Injustificadas", "Cumplimiento_pct"]],
+    use_container_width=True
 )
 
-turnos_base = turnos_plan.merge(name_map, on="RUT_norm", how="left")
-turnos_base["Nombre"] = turnos_base["Nombre"].fillna("")
-turnos_base["Primer Apellido"] = turnos_base["Primer Apellido"].fillna("")
-turnos_base["Segundo Apellido"] = turnos_base["Segundo Apellido"].fillna("")
-turnos_base = turnos_base.sort_values(["Nombre", "Primer Apellido", "Segundo Apellido", "RUT_norm"])
 
 # =========================
-# Export Excel:
-# - Agregamos columna oculta RUT_norm_hidden solo para que Cumplimiento tenga conteo exacto.
+# Export Excel (con validación + estilo + fórmulas para que sea dinámico en Excel)
 # =========================
-st.subheader("Descarga (Excel dinámico)")
+def build_excel_bytes(detalle_df: pd.DataFrame, workers_df: pd.DataFrame, start_d: date, end_d: date) -> BytesIO:
+    wb = Workbook()
 
-export_df = edited.copy()
-export_df["Fecha"] = pd.to_datetime(export_df["Fecha"], errors="coerce")
+    # Estilos
+    header_fill = PatternFill("solid", fgColor=CABIFY_PURPLE)
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="DDDDDD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(vertical="center", wrap_text=True)
 
-# Columna técnica para fórmulas (se oculta en Excel)
-export_df["RUT_norm_hidden"] = export_df["RUT"].apply(normalize_rut)
+    # ---------------- Sheet: Detalle
+    ws_det = wb.active
+    ws_det.title = "Detalle"
 
-excel_bytes = to_excel_bytes_dynamic(
-    incidencias_df=export_df,
-    turnos_base_df=turnos_base[["Nombre", "Primer Apellido", "Segundo Apellido", "RUT_norm", "Turnos_planificados"]]
+    # Asegurar tipo fecha
+    dfw = detalle_df.copy()
+    dfw["Fecha"] = pd.to_datetime(dfw["Fecha"], errors="coerce")
+
+    # Orden exacto requerido
+    cols = ["Fecha", "Nombre", "Primer Apellido", "Segundo Apellido", "RUT", "Turno",
+            "Especialidad", "Supervisor", "Tipo_Incidencia", "Detalle", "Clasificación Manual"]
+    dfw = dfw[cols].copy()
+
+    # Escribir dataframe
+    for r_idx, row in enumerate(dataframe_to_rows(dfw, index=False, header=True), start=1):
+        ws_det.append(row)
+
+        # Header
+        if r_idx == 1:
+            for c in range(1, len(cols) + 1):
+                cell = ws_det.cell(row=1, column=c)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = border
+        else:
+            for c in range(1, len(cols) + 1):
+                cell = ws_det.cell(row=r_idx, column=c)
+                cell.border = border
+                cell.alignment = center
+
+    # Formato fecha corta en Excel (col 1)
+    for r in range(2, ws_det.max_row + 1):
+        ws_det.cell(row=r, column=1).number_format = "dd-mm-yyyy"
+
+    # Autosize básico
+    for col_idx in range(1, len(cols) + 1):
+        ws_det.column_dimensions[chr(64 + col_idx)].width = 18
+    ws_det.column_dimensions["J"].width = 40  # Detalle
+    ws_det.column_dimensions["K"].width = 26  # Clasificación
+
+    # DataValidation dropdown en "Clasificación Manual" (col K)
+    dv = DataValidation(type="list", formula1=f"\"{','.join(DROPDOWN_OPTS)}\"", allow_blank=False)
+    ws_det.add_data_validation(dv)
+    dv.add(f"K2:K1048576")
+
+    # Set default "Seleccionar" si viene vacío
+    for r in range(2, ws_det.max_row + 1):
+        c = ws_det.cell(row=r, column=11)
+        if c.value is None or str(c.value).strip() == "":
+            c.value = "Seleccionar"
+
+    # ---------------- Sheet: Resumen (DINÁMICO EN EXCEL)
+    ws_res = wb.create_sheet("Resumen")
+    ws_res.append(["Tipo_Incidencia", "Clasificación Manual", "Cantidad"])
+    for c in range(1, 4):
+        cell = ws_res.cell(row=1, column=c)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    tipos = ["Marcaje/Turno", "Inasistencia"]
+    for t in tipos:
+        for cl in DROPDOWN_OPTS:
+            ws_res.append([t, cl, None])
+
+    # Fórmula COUNTIFS (usa columnas: I=Tipo_Incidencia, K=Clasificación)
+    for r in range(2, ws_res.max_row + 1):
+        t = ws_res.cell(row=r, column=1).value
+        cl = ws_res.cell(row=r, column=2).value
+        ws_res.cell(row=r, column=3).value = f'=COUNTIFS(Detalle!$I:$I,"{t}",Detalle!$K:$K,"{cl}")'
+        for c in range(1, 4):
+            ws_res.cell(row=r, column=c).border = border
+            ws_res.cell(row=r, column=c).alignment = center
+
+    ws_res.column_dimensions["A"].width = 18
+    ws_res.column_dimensions["B"].width = 28
+    ws_res.column_dimensions["C"].width = 12
+
+    # ---------------- Sheet: Cumplimiento (DINÁMICO EN EXCEL en base a clasificación)
+    ws_c = wb.create_sheet("Cumplimiento")
+    ws_c.append(["Nombre del Colaborador", "RUT", "Supervisor", "Turnos_Planificados", "Inc_Injustificadas", "Cumplimiento_%"])
+    for c in range(1, 7):
+        cell = ws_c.cell(row=1, column=c)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    # Calcula planificados desde workers_df (ya viene calculado en app) -> lo pasamos estático
+    # La parte dinámica será el conteo de "Injustificada" desde Detalle
+    for _, row in workers_df.iterrows():
+        ws_c.append([
+            row.get("Nombre del Colaborador", ""),
+            row.get("RUT", ""),
+            row.get("Supervisor", ""),
+            int(row.get("Turnos_Planificados", 0)),
+            None,
+            None
+        ])
+
+    # Celdas de control (fechas) en una zona discreta (H1:H2)
+    ws_c["H1"] = "FechaInicio"
+    ws_c["H2"] = "FechaFin"
+    ws_c["I1"] = start_d
+    ws_c["I2"] = end_d
+    ws_c["I1"].number_format = "dd-mm-yyyy"
+    ws_c["I2"].number_format = "dd-mm-yyyy"
+
+    # Fórmulas:
+    # Inc_Injustificadas = COUNTIFS(Detalle!E:E, RUT, Detalle!K:K, "Injustificada", Detalle!A:A, >=I1, Detalle!A:A, <=I2)
+    # Cumplimiento = IF(D=0,1,1 - E/D)
+    for r in range(2, ws_c.max_row + 1):
+        rut_cell = ws_c.cell(row=r, column=2).coordinate  # B
+        ws_c.cell(row=r, column=5).value = (
+            f'=COUNTIFS(Detalle!$E:$E,{rut_cell},Detalle!$K:$K,"Injustificada",'
+            f'Detalle!$A:$A,">="&$I$1,Detalle!$A:$A,"<="&$I$2)'
+        )
+        planned_cell = ws_c.cell(row=r, column=4).coordinate  # D
+        unjust_cell = ws_c.cell(row=r, column=5).coordinate   # E
+        ws_c.cell(row=r, column=6).value = f'=IF({planned_cell}=0,1,MAX(0,1-({unjust_cell}/{planned_cell})))'
+        ws_c.cell(row=r, column=6).number_format = "0.00%"
+
+        for c in range(1, 7):
+            ws_c.cell(row=r, column=c).border = border
+            ws_c.cell(row=r, column=c).alignment = center
+
+    ws_c.column_dimensions["A"].width = 34
+    ws_c.column_dimensions["B"].width = 16
+    ws_c.column_dimensions["C"].width = 28
+    ws_c.column_dimensions["D"].width = 18
+    ws_c.column_dimensions["E"].width = 18
+    ws_c.column_dimensions["F"].width = 16
+
+    # Guardar a bytes
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
+# Preparar workers_df para export (con turnos planificados)
+planned_export = (
+    df_turnos_long[df_turnos_long["Es_Turno_Planificado"]]
+    .groupby("RUT_norm", as_index=False)
+    .size()
+    .rename(columns={"size": "Turnos_Planificados"})
+)
+workers_export = df_workers.merge(planned_export, on="RUT_norm", how="left")
+workers_export["Turnos_Planificados"] = workers_export["Turnos_Planificados"].fillna(0).astype(int)
+
+# Excel bytes (detalle = lo editado)
+detalle_export = edited.copy()
+detalle_export["Fecha"] = pd.to_datetime(detalle_export["Fecha"], errors="coerce")
+
+st.subheader("Descarga")
+excel_bytes = build_excel_bytes(
+    detalle_df=detalle_export,
+    workers_df=workers_export,
+    start_d=date_start,
+    end_d=date_end
 )
 
 st.download_button(
-    "Descargar Excel consolidado (dropdown + fórmulas + Cabify)",
+    "Descargar Excel (Cabify + Dropdown + Resumen/Cumplimiento dinámicos)",
     data=excel_bytes,
-    file_name="reporte_incidencias_consolidado.xlsx",
+    file_name="reporte_incidencias_cabify.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-
-st.caption(
-    "En el Excel descargado: edita 'Clasificación Manual' (dropdown). "
-    "Las hojas 'Resumen' y 'Cumplimiento' se actualizan por fórmulas."
 )
